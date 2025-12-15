@@ -80,25 +80,18 @@ class SevirTimeTransDataset(Dataset):
 
     def __len__(self):
         # 返回拆分后样本的数量，每个文件被拆分为多个子序列（每个子序列有 sequence_length 帧）
-        # print(len(self.h5_files) * ((49 // self.sequence_length) + (1 if 49 % self.sequence_length != 0 else 0)))
-        # input()
-        return len(self.h5_files) * (49 // self.sequence_length) + (1 if 49 % self.sequence_length != 0 else 0)
+        # 49帧可以切分为 49 // sequence_length 个完整序列
+        return len(self.h5_files) * (49 // self.sequence_length)
 
     def __getitem__(self, index):
         # 计算当前文件和当前帧在子序列中的位置
-        file_index = index // (49 // self.sequence_length+1)  # 计算对应文件
-        sequence_index = index % (49 // self.sequence_length+1)  # 计算对应子序列
+        num_sequences_per_file = 49 // self.sequence_length
+        file_index = index // num_sequences_per_file  # 计算对应文件
+        sequence_index = index % num_sequences_per_file  # 计算对应子序列
 
         h5_file = self.h5_files[file_index]
         start_frame = sequence_index * self.sequence_length  # 计算当前子序列的起始帧
-        
-
-        # 如果是最后一段（39-49帧），确保至少有 10 帧
-        if start_frame + self.sequence_length > 48:
-            start_frame = 38  # 确保从第39帧开始
-            end_frame = 48  # 直到第49帧
-        else:
-            end_frame = start_frame + self.sequence_length  # 否则按标准长度取帧
+        end_frame = start_frame + self.sequence_length  # 固定长度
         # print(start_frame,end_frame)
         # input()
         with h5py.File(h5_file, 'r') as f:

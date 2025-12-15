@@ -755,8 +755,8 @@ class SSCVAE(nn.Module):
         is_multi_frame = (satellite.dim() == 5)
         
         if is_multi_frame:
-            satellite = satellite.permute(0, 4, 1, 2, 3)  # [B, C, H, W, T] -> [B, T, C, H, W]
-            vil = vil.permute(0, 4, 1, 2, 3)
+            satellite = satellite.permute(0, 4, 1, 2, 3).contiguous()  # [B, C, H, W, T] -> [B, T, C, H, W]
+            vil = vil.permute(0, 4, 1, 2, 3).contiguous()
             
             B, T, C_sat, H, W = satellite.size()
             _, _, C_vil, _, _ = vil.size()
@@ -883,8 +883,8 @@ class SSCVAEDouble(nn.Module):
         is_multi_frame = (satellite.dim() == 5)
         
         if is_multi_frame:
-            satellite = satellite.permute(0, 4, 1, 2, 3)  # [B, C, H, W, T] -> [B, T, C, H, W]
-            vil = vil.permute(0, 4, 1, 2, 3)
+            satellite = satellite.permute(0, 4, 1, 2, 3).contiguous()  # [B, C, H, W, T] -> [B, T, C, H, W]
+            vil = vil.permute(0, 4, 1, 2, 3).contiguous()
             
             B, T, C_sat, H, W = satellite.size()
             _, _, C_vil, _, _ = vil.size()
