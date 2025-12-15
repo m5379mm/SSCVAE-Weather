@@ -1,0 +1,33 @@
+{
+    "data": {
+        "dataset": "sevir",
+        "root_dir": "/root/autodl-tmp/earthformer-satellite-to-radar-main/data",
+        "seed": 1,
+        "train_ratio": 0.8,
+        "val_ratio": 0.2,
+        "patch_size": 128,
+        "stride_size": 128,
+        "batch_size": 1
+    },
+    "model": {
+        "in_channels_sate": 3,
+        "in_channels_radar" : 1,
+        "hid_channels_1": 64,
+        "hid_channels_2": 128,
+        "out_channels": 256,
+        "down_samples": 3,
+        "num_groups": 16,
+        "num_atoms": 128,
+        "num_dims": 256,
+        "num_iters": 16
+    },
+    "train": {
+        "lr": 1e-4,
+        "epochs": 300,
+        "save_frequency": 1,
+        "save_path": "/root/autodl-tmp/results/sscvae_recon_sevir"
+    },
+    "test": {
+        "model_id": "best_model"
+    }
+}
