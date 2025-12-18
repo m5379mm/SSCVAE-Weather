@@ -69,8 +69,8 @@ model = SSCVAEDouble(in_channels_radar=model_args.in_channels_radar,
 
 # load_path = os.path.join(model_fold_path, f'best_model.pt')
 # load_path = "/root/autodl-tmp/results/sscvae_recon_sevir/models/best_model.pt"
-load_path = "/root/autodl-tmp/results/sscvae_recon_sevir_single/models/best_model.pt"
-model.load_state_dict(torch.load(load_path))
+load_path = "/root/autodl-tmp/results/sscvae_recon_sevir_trans/models/best_model.pt"
+model.load_state_dict(torch.load(load_path), strict=False)  # strict=False 忽略多余或缺失的键
 model.eval()
 
 

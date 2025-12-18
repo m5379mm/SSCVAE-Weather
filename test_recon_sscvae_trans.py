@@ -68,8 +68,8 @@ model = SSCVAE(in_channels_radar=model_args.in_channels_radar,
                device=device).to(device)
 
 load_path = os.path.join(model_fold_path, f'best_model.pt')
-load_path = "/root/autodl-tmp/results/sscvae_recon_sevir_trans/models/best_model.pth"
-model.load_state_dict(torch.load(load_path, map_location=device))
+load_path = "/root/autodl-tmp/results/sscvae_recon_sevir_trans/models/best_model.pt"
+model.load_state_dict(torch.load(load_path, map_location=device), strict=False)  # strict=False 忽略多余或缺失的键
 model.eval()
 
 

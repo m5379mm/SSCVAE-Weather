@@ -82,9 +82,17 @@ def unfreeze_mlp(model):
     if hasattr(model, "_mlp"):
         for param in model._mlp.parameters():
             param.requires_grad = True
-    # # 解冻解码器的参数
-    # for param in model._decoder_radar.parameters():
-    #     param.requires_grad = True
+
+def unfreeze_decoder(model):
+    """解冻 Decoder 模块的参数"""
+    if hasattr(model, "_decoder_radar"):
+        for param in model._decoder_radar.parameters():
+            param.requires_grad = True
+
+def unfreeze_all_for_finetuning(model):
+    """解冻所有层进行微调（推荐用于多帧适应）"""
+    for param in model.parameters():
+        param.requires_grad = True
 
 def train(data_args, model_args, train_args, test_args):
     model_fold_path = os.path.join(train_args.save_path, 'models')
@@ -107,17 +115,58 @@ def train(data_args, model_args, train_args, test_args):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = SSCVAE(**vars(model_args), device=device).to(device)
 
-    load_path = os.path.join(train_args.origin_path, 'models', 'best_model.pt')
-    load_path = "/root/autodl-tmp/results/sscvae_recon_sevir_trans/models/best_model.pth"
-    print(load_path)
-    checkpoint = torch.load(load_path)
-    model.load_state_dict(checkpoint, strict=False)
+    # load_path = os.path.join(train_args.origin_path, 'models', 'best_model.pt')
+    load_path = "/root/autodl-tmp/results/sscvae_recon_sevir_trans_single/models/best_modellastbest.pth"
+    print(f"📂 加载预训练模型: {load_path}")
+    # input()
+    
+    if os.path.exists(load_path):
+        checkpoint = torch.load(load_path)
+        model.load_state_dict(checkpoint, strict=False)
+        print("✅ 成功加载预训练权重")
+    else:
+        print("⚠️  未找到预训练模型，从头开始训练")
 
-    # 冻结所有层
-    freeze_all_layers(model)
-
-    # 只解冻 MLP 层
-    unfreeze_mlp(model)
+    # ============ 训练策略选择 ============
+    # 策略1: 只训练MLP (快速，但效果受限于单帧预训练特征)
+    # 策略2: 训练MLP + Decoder (中等效果，让解码适应多帧)
+    # 策略3: 微调整个模型 (最佳效果，所有模块适应多帧) ⭐推荐
+    
+    TRAINING_STRATEGY = "finetune_all"  # 选项: "mlp_only" | "mlp_decoder" | "finetune_all"
+    
+    if TRAINING_STRATEGY == "mlp_only":
+        print("🔧 训练策略: 只训练 MLP")
+        freeze_all_layers(model)
+        unfreeze_mlp(model)
+        optim_groups = [{
+            'params': [p for p in model._mlp.parameters() if p.requires_grad],
+            'lr': 3e-3,
+        }]
+    
+    elif TRAINING_STRATEGY == "mlp_decoder":
+        print("🔧 训练策略: 训练 MLP + Decoder")
+        freeze_all_layers(model)
+        unfreeze_mlp(model)
+        unfreeze_decoder(model)
+        optim_groups = [
+            {'params': [p for p in model._mlp.parameters() if p.requires_grad], 'lr': 3e-3},
+            {'params': [p for p in model._decoder_radar.parameters() if p.requires_grad], 'lr': 1e-4},
+        ]
+    
+    elif TRAINING_STRATEGY == "finetune_all":
+        print("🔧 训练策略: 微调整个模型（推荐用于多帧适应）")
+        unfreeze_all_for_finetuning(model)
+        # 使用差异化学习率：新模块（MLP）用高学习率，预训练模块用低学习率
+        optim_groups = [
+            {'params': model._encoder_sate.parameters(), 'lr': 1e-5},
+            {'params': model._encoder_radar.parameters(), 'lr': 1e-5},
+            {'params': model._LISTA.parameters(), 'lr': 1e-5},
+            {'params': model._decoder_radar.parameters(), 'lr': 5e-5},
+            {'params': model._mlp.parameters(), 'lr': 1e-3},
+        ]
+    
+    else:
+        raise ValueError(f"未知的训练策略: {TRAINING_STRATEGY}")
 
     # 验证：打印可训练参数
     print("\n✅ 可训练的参数（requires_grad=True）:")
@@ -127,16 +176,6 @@ def train(data_args, model_args, train_args, test_args):
             print(f"  - {name}: {param.numel()} 参数")
             trainable_params += param.numel()
     print(f"总可训练参数数量: {trainable_params:,}\n")
-
-    # 设置优化器，仅训练 MLP 层
-    optim_groups = []
-    if hasattr(model, "_mlp"):
-        optim_groups.append({
-            'params': [p for p in model._mlp.parameters() if p.requires_grad],
-            'lr': 3e-3,
-        })
-    else:
-        raise ValueError("模型没有 _mlp 属性，无法训练！")
 
     optimizer = torch.optim.AdamW(optim_groups, weight_decay=1e-5)
 
@@ -227,7 +266,7 @@ def train(data_args, model_args, train_args, test_args):
 
         if early_stopping.early_stop:
             print("Early stopping triggered. Loading best model...")
-            model.load_state_dict(torch.load(early_stopping.path))
+            model.load_state_dict(torch.load(early_stopping.path), strict=False)
             break
 
         if (epoch + 1) % train_args.save_frequency == 0:
