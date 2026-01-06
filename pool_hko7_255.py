@@ -18,16 +18,56 @@ import os
 from utils.fixedValues import PREPROCESS_SCALE_SEVIR, PREPROCESS_OFFSET_SEVIR
 import torch.nn.functional as F
 from skimage.metrics import structural_similarity as ssim
+from properscoring import crps_ensemble  # 标准 CRPS 库
 
-# CRPS
+# CRPS (使用标准库 properscoring)
 def compute_crps(pred, gt):
-    return float(torch.mean((pred - gt) ** 2).cpu())
+    """
+    使用 properscoring 库计算标准 CRPS
+    对于确定性预测，将其视为单成员集合预报
+    
+    Args:
+        pred: torch.Tensor [B, C, H, W] or [B, C, H, W, T]
+        gt: torch.Tensor [B, C, H, W] or [B, C, H, W, T]
+    
+    Returns:
+        float: 平均 CRPS 值（归一化到数据范围）
+    """
+    # 转换为 numpy
+    pred_np = pred.cpu().numpy()
+    gt_np = gt.cpu().numpy()
+    
+    # 展平所有维度（除了样本维度）
+    pred_flat = pred_np.reshape(pred_np.shape[0], -1)  # [B, N]
+    gt_flat = gt_np.reshape(gt_np.shape[0], -1)        # [B, N]
+    
+    # 对于确定性预测，ensemble 只有1个成员
+    # crps_ensemble 需要 observations 形状为 [N], forecasts 形状为 [N, ensemble_size]
+    crps_values = []
+    for i in range(pred_flat.shape[0]):
+        # 对每个样本计算 CRPS
+        observations = gt_flat[i]                      # [N]
+        forecasts = pred_flat[i:i+1].T                 # [N, 1] - 单成员集合（转置）
+        
+        # 计算 CRPS（返回每个点的 CRPS，然后取平均）
+        crps_val = crps_ensemble(observations, forecasts).mean()
+        crps_values.append(crps_val)
+    
+    # 归一化到全局数据范围 [0, 255]
+    # 使用固定的数据范围，而不是每个样本的范围
+    GLOBAL_DATA_RANGE = 255.0  # VIL 数据的理论最大值
+    
+    mean_crps = np.mean(crps_values)
+    normalized_crps = mean_crps / GLOBAL_DATA_RANGE
+    
+    return float(normalized_crps)
 
 # SSIM
 def compute_ssim_torch(pred, gt):
     pred = pred.squeeze().cpu().numpy()
     gt = gt.squeeze().cpu().numpy()
-    return ssim(gt, pred, data_range=gt.max() - gt.min())
+    # 使用固定的全局数据范围 [0, 255]
+    return ssim(gt, pred, data_range=255.0)
 
 # HSS
 def compute_hss(pred, gt, threshold):
@@ -46,25 +86,6 @@ def compute_hss(pred, gt, threshold):
     denominator = ((TP + FN)*(FN + TN) + (TP + FP)*(FP + TN)) + 1e-8
     return numerator / denominator
 
-def downsample_to_128x128(x):
-    # 如果 x 是 5D (1, 1, 1, H, W)，则 squeeze 掉多余的维度
-    if x.dim() == 5:
-        x = x.squeeze(0) # 删除第一个和第二个维度，变为 [1, H, W]
-
-    # 如果是 3D 的话，转化为 [1, C, H, W] 的格式
-    elif x.dim() == 3:
-        x = x.unsqueeze(0)  # 添加 batch 维度 [1, C, H, W]
-    
-    # 如果是 4D 则无需修改
-    elif x.dim() != 4:
-        raise ValueError(f"Unexpected input shape {x.shape}, expected 4D or 5D")
-    
-    # 下采样到 128x128
-    pool = nn.MaxPool2d(kernel_size=2, stride=2)
-    x = pool(x)
-
-    return x
-
  # squeeze if needed
 
     # return F.interpolate(x, size=(128, 128), mode='bilinear', align_corners=False)
@@ -75,8 +96,8 @@ def downsample_to_128x128(x):
 model_name = "SimVP_incepu_hko7_255_thr_rain_0.1_rainfall_thr185_002_01_nig3_newsplit"
 
 # 原来保存 preds.npy、trues.npy 的路径
-PRED_PATH = f"/root/autodl-tmp/results/sscvae_recon_sevir_trans/images/reconstructed_images"
-TRUE_PATH = f"/root/autodl-tmp/results/sscvae_recon_sevir_trans/images/true_images"
+PRED_PATH = f"/root/autodl-tmp/results/sscvae_recon_sevir_gan/images/reconstructed_images_single"
+TRUE_PATH = f"/root/autodl-tmp/results/sscvae_recon_sevir_gan/images/true_images_single"
 
 
 

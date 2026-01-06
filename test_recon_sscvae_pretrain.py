@@ -117,7 +117,7 @@ with torch.no_grad():
             lpips_list.append(LPIPS)
 
             # 绘制每一帧的图像
-            plot_images(satellite[:, :, :, :, t], x_recon_sate[:, t, :, :, :], image_fold_path, str(batch_idx)+str(t), channels=3)
+            plot_images(satellite[:, :, :, :, t], x_recon_sate[:, t, :, :, :], image_fold_path, "sate_"+str(batch_idx)+str(t), channels=3)
             print(789789789789789)
 
         # 计算每个指标的平均值
@@ -151,7 +151,7 @@ with torch.no_grad():
             nmi_list.append(NMI)
             lpips_list.append(LPIPS)
             
-            plot_images(vil[:, :, :, :, t], x_recon_radar[:, t, :, :, :], image_fold_path, str(batch_idx)+str(t), channels=1)
+            plot_images(vil[:, :, :, :, t], x_recon_radar[:, t, :, :, :], image_fold_path, "radar_"+str(batch_idx)+str(t), channels=1)
 
         # 计算平均指标
         avg_psnr = torch.mean(torch.tensor(psnr_list))

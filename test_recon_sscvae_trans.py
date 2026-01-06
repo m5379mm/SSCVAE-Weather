@@ -55,26 +55,25 @@ test_image_num = len(test_dataset)
 '''model'''
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-model = SSCVAE(in_channels_radar=model_args.in_channels_radar,
-               in_channels_sate =model_args.in_channels_sate,
-               hid_channels_1=model_args.hid_channels_1,
-               hid_channels_2=model_args.hid_channels_2,
-               out_channels=model_args.out_channels,
-               down_samples=model_args.down_samples,
-               num_groups=model_args.num_groups,
-               num_atoms=model_args.num_atoms,
-               num_dims=model_args.num_dims,
-               num_iters=model_args.num_iters,
-               device=device).to(device)
+# ✅ 启用时间注意力以支持 LISTA temporal 微调后的模型
+model = SSCVAE(**vars(model_args), device=device, use_time_attention=True).to(device)
 
+# 使用配置文件中的路径，而不是硬编码
 load_path = os.path.join(model_fold_path, f'best_model.pt')
-load_path = "/root/autodl-tmp/results/sscvae_recon_sevir_trans/models/best_model.pt"
+print(f"📂 加载模型权重: {load_path}")
+
+if not os.path.exists(load_path):
+    raise FileNotFoundError(f"模型文件不存在: {load_path}")
+
 model.load_state_dict(torch.load(load_path, map_location=device), strict=False)  # strict=False 忽略多余或缺失的键
 model.eval()
+print("✅ 模型加载完成，进入评估模式")
 
 
 '''test'''
 csv_filename = os.path.join(train_args.save_path, 'testing_indicators.csv')
+print(f"📊 测试结果将保存到: {csv_filename}")
+
 with open(csv_filename, 'w', newline='') as csvfile:
     fieldnames = ['Name', 'Sparsity', 'PSNR', 'SSIM', 'NMI', 'LPIPS']
     writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -83,13 +82,15 @@ with open(csv_filename, 'w', newline='') as csvfile:
 plot_dict = True
 import numpy as np
 
-# # 定义保存路径
-PRED_PATH = f"/root/autodl-tmp/results/sscvae_recon_sevir_trans/images/reconstructed_images"
-TRUE_PATH = f"/root/autodl-tmp/results/sscvae_recon_sevir_trans/images/true_images"
+# 定义保存路径（使用配置文件中的路径）
+PRED_PATH = os.path.join(train_args.save_path, "images", "reconstructed_images_single")
+TRUE_PATH = os.path.join(train_args.save_path, "images", "true_images_single")
 
 # 创建保存路径的文件夹（如果没有的话）
 os.makedirs(PRED_PATH, exist_ok=True)
 os.makedirs(TRUE_PATH, exist_ok=True)
+print(f"📁 重建图像保存路径: {PRED_PATH}")
+print(f"📁 真实图像保存路径: {TRUE_PATH}")
 
 # # 用np.save替换plot_images，保存为.npy文件
 # with torch.no_grad():
@@ -142,6 +143,7 @@ os.makedirs(TRUE_PATH, exist_ok=True)
 #                              'LPIPS': avg_lpips.item()})
 
 with torch.no_grad():
+    print(f"\n🚀 开始测试，共 {test_image_num} 个样本...")
     for batch_idx, (satellite, vil) in enumerate(test_loader):
         satellite = satellite.to(device)
         bs, _, _, _,T = satellite.shape
@@ -167,14 +169,12 @@ with torch.no_grad():
             ssim_list.append(SSIM)
             nmi_list.append(NMI)
             lpips_list.append(LPIPS)
-            #print(batch_idx)
-                        # 保存图像为.npy文件
+            
+            # 保存图像为.npy文件
             # 保存原始图像 (vil) 和重建图像 (x_recon_trans_bchwt) 为.npy文件
             np.save(os.path.join(PRED_PATH, f"{batch_idx}_{t}_vil.npy"), vil[:, :, :, :, t].cpu().numpy())
             np.save(os.path.join(TRUE_PATH, f"{batch_idx}_{t}_recon.npy"), x_recon_trans[:, t, :, :, :].cpu().numpy())
-            # print(batch_idx, t)
             # plot_images(vil[:, :, :, :, t], x_recon_trans[:, t, :, :, :], image_fold_path, str(batch_idx)+'+'+str(t), channels=1)
-            # print(batch_idx,t)
 
         # 计算平均指标
         avg_psnr = torch.mean(torch.tensor(psnr_list))
@@ -191,3 +191,9 @@ with torch.no_grad():
                              'SSIM': avg_ssim.item(),
                              'NMI': avg_nmi.item(),
                              'LPIPS': avg_lpips.item()})
+        
+        # 每处理10个样本打印一次进度
+        if (batch_idx + 1) % 10 == 0:
+            print(f"  进度: {batch_idx + 1}/{test_image_num} | PSNR: {avg_psnr:.4f}, SSIM: {avg_ssim:.4f}")
+
+print(f"\n✅ 测试完成！结果已保存到: {csv_filename}")

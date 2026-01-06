@@ -5,7 +5,7 @@ from torch.nn import functional as F
 import numpy as np
 import math
 from geomloss import SamplesLoss
-
+from enhanced_losses import EnhancedReconstructionLoss
 # 注意力机制的编码器-解码器，并引入了LISTA用于稀疏编码的解码部分
 
 # 通道注意力机制：通过全局平均池化和最大池化来提取每个通道的全局信息，然后通过一系列全连接层生成通道注意力权重，最终，输入特征图与这些权重相乘，以强调重要的通道特征。
@@ -389,20 +389,42 @@ class LISTA(nn.Module):
 
 # 时间注意力模块：对多帧序列在时间维度上进行加权
 class TemporalAttention(nn.Module):
-    def __init__(self, num_steps):
+    def __init__(self, num_steps, channels=None):
         super().__init__()
         self.num_steps = num_steps
-        # 用一个可训练的向量表示每个时间步的重要性
-        self.attn = nn.Parameter(torch.randn(1, num_steps, 1, 1, 1))  # [1, T, 1, 1, 1]
+        
+        # 增强版：使用卷积网络学习时序依赖
+        if channels is None:
+            # 简化版：仅使用可学习的权重向量
+            self.attn = nn.Parameter(torch.randn(1, num_steps, 1, 1, 1))  # [1, T, 1, 1, 1]
+            self.use_conv = False
+        else:
+            # 增强版：使用1D卷积学习时序模式
+            self.use_conv = True
+            self.temporal_conv = nn.Sequential(
+                nn.Conv3d(channels, channels // 4, kernel_size=(3, 1, 1), padding=(1, 0, 0), groups=1),
+                nn.BatchNorm3d(channels // 4),
+                nn.ReLU(),
+                nn.Conv3d(channels // 4, 1, kernel_size=(3, 1, 1), padding=(1, 0, 0)),
+            )
+        
         self.softmax = nn.Softmax(dim=1)  # softmax 在时间维度
 
     def forward(self, x):  # x: [B, T, C, H, W]
-        # 1. 复制权重到 batch 维度
-        attn_scores = self.attn.expand(x.size(0), -1, x.size(2), x.size(3), x.size(4))  # [B, T, C, H, W]
-        # 2. 在时间维度 softmax
-        attn_scores = self.softmax(attn_scores)  # [B, T, C, H, W]
-        # 3. 加权
-        x_attended = x * attn_scores  # [B, T, C, H, W]
+        if self.use_conv:
+            # 增强版：通过卷积学习时序注意力
+            B, T, C, H, W = x.size()
+            x_perm = x.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
+            attn_logits = self.temporal_conv(x_perm)  # [B, 1, T, H, W]
+            attn_logits = attn_logits.permute(0, 2, 1, 3, 4)  # [B, T, 1, H, W]
+            attn_scores = self.softmax(attn_logits)  # [B, T, 1, H, W]
+            x_attended = x * attn_scores.expand_as(x)  # [B, T, C, H, W]
+        else:
+            # 简化版：使用可学习权重
+            attn_scores = self.attn.expand(x.size(0), -1, x.size(2), x.size(3), x.size(4))  # [B, T, C, H, W]
+            attn_scores = self.softmax(attn_scores)  # [B, T, C, H, W]
+            x_attended = x * attn_scores  # [B, T, C, H, W]
+        
         return x_attended
 
 
@@ -438,7 +460,9 @@ class AttentiveLISTA(nn.Module):
 
         # 添加时间注意力模块
         if self.use_time_attention:
-            self._time_attention = TemporalAttention(num_steps=1)  # 初始值，会在forward中动态设置
+            # ✅ 使用增强版：传入 channels 参数以启用卷积注意力
+            # 这里 num_dims 是潜在空间的通道数
+            self._time_attention = TemporalAttention(num_steps=1, channels=num_atoms)
 
         self._num_iters = num_iters
     
@@ -924,6 +948,663 @@ class SSCVAEDouble(nn.Module):
         else:
             x_recon_sate = torch.sigmoid(self._decoder_sate(ex_recon_sate))
             x_recon_radar = torch.sigmoid(self._decoder_radar(ex_recon_radar))
+
+        # 计算损失
+        latent_loss_sate = torch.sum((ex_recon_sate - ex_sate).pow(2), dim=1).mean()
+        latent_loss_radar = torch.sum((ex_recon_radar - ex_radar).pow(2), dim=1).mean()
+        total_latent_loss = latent_loss_sate + latent_loss_radar
+
+        return x_recon_sate, x_recon_radar, z_sate, z_radar, total_latent_loss, dictionary
+
+
+# ============================================================================
+# 🎬 3D 时空卷积模块 (用于真正的多帧时序建模)
+# ============================================================================
+
+# 3D 残差块
+class ResidualBlock3D(nn.Module):
+    def __init__(self, in_channels, hid_channels):
+        super(ResidualBlock3D, self).__init__()
+        
+        self._block = nn.Sequential(
+            nn.ReLU(inplace=True),
+            nn.Conv3d(in_channels=in_channels,
+                      out_channels=hid_channels,
+                      kernel_size=3, stride=1, padding=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(in_channels=hid_channels,
+                      out_channels=in_channels,
+                      kernel_size=1, stride=1, bias=False)
+        )
+    
+    def forward(self, x):
+        return x + self._block(x)
+
+
+# 3D 下采样（只在空间维度下采样，时间维度保持）
+class DownSampleBlock3D(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(DownSampleBlock3D, self).__init__()
+
+        self._block = nn.Sequential(
+            nn.Conv3d(in_channels=in_channels,
+                      out_channels=out_channels,
+                      kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=(1, 1, 1)),
+            nn.BatchNorm3d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2))  # 只在 H,W 下采样
+        )
+    
+    def forward(self, x):
+        return self._block(x)
+
+
+# 3D 上采样（只在空间维度上采样，时间维度保持）
+class UpSampleBlock3D(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(UpSampleBlock3D, self).__init__()
+
+        self._block = nn.Sequential(
+            nn.ConvTranspose3d(in_channels=in_channels,
+                               out_channels=out_channels,
+                               kernel_size=(1, 2, 2), stride=(1, 2, 2)),  # 只在 H,W 上采样
+            nn.Conv3d(in_channels=out_channels,
+                      out_channels=out_channels,
+                      kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=(1, 1, 1)),
+            nn.BatchNorm3d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+    
+    def forward(self, x):
+        return self._block(x)
+
+
+# 3D 非局部注意力块
+class NonLocalBlock3D(nn.Module):
+    def __init__(self, in_channels, hid_channels):
+        super(NonLocalBlock3D, self).__init__()
+
+        self.hid_channels = hid_channels
+        self._conv_theta = nn.Conv3d(in_channels=in_channels,
+                                     out_channels=hid_channels,
+                                     kernel_size=1, stride=1, padding=0, bias=False)
+        self._conv_phi = nn.Conv3d(in_channels=in_channels,
+                                   out_channels=hid_channels,
+                                   kernel_size=1, stride=1, padding=0, bias=False)
+        self._conv_g = nn.Conv3d(in_channels=in_channels,
+                                 out_channels=hid_channels,
+                                 kernel_size=1, stride=1, padding=0, bias=False)
+        self._soft_max = nn.Softmax(dim=1)
+        self._conv_mask = nn.Conv3d(in_channels=hid_channels,
+                                    out_channels=in_channels,
+                                    kernel_size=1, stride=1, padding=0, bias=False)
+
+    def forward(self, x):
+        b, c, t, h, w = x.size()
+
+        # [B, C, T, H, W] -> [B, C', THW] -> [B, THW, C']
+        theta = self._conv_theta(x).view(b, self.hid_channels, -1).permute(0, 2, 1).contiguous()
+        # [B, C, T, H, W] -> [B, C', THW]
+        phi = self._conv_phi(x).view(b, self.hid_channels, -1)
+        # [B, C, T, H, W] -> [B, C', THW] -> [B, THW, C']
+        g = self._conv_g(x).view(b, self.hid_channels, -1).permute(0, 2, 1).contiguous()
+        # [B, THW, C'] * [B, C', THW] = [B, THW, THW]
+        mul_theta_phi = self._soft_max(torch.matmul(theta, phi))
+        # [B, THW, THW] * [B, THW, C'] = [B, THW, C']
+        mul_theta_phi_g = torch.matmul(mul_theta_phi, g)
+        # [B, THW, C'] -> [B, C', THW] -> [B, C', T, H, W]
+        mul_theta_phi_g = mul_theta_phi_g.permute(0, 2, 1).contiguous().view(b, self.hid_channels, t, h, w)
+        # [B, C', T, H, W] -> [B, C, T, H, W]
+        mask = self._conv_mask(mul_theta_phi_g)
+
+        return x + mask
+
+
+# 3D 通道注意力
+class ChannelAttention3D(nn.Module):
+    def __init__(self, in_channels, reduction):
+        super(ChannelAttention3D, self).__init__()
+        self._avg_pool = nn.AdaptiveAvgPool3d(1)  # 全局平均池化
+        self._max_pool = nn.AdaptiveMaxPool3d(1)  # 最大池化
+        self._fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // reduction, in_channels, bias=False),
+        )
+        self._sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        b, c, _, _, _ = x.size()
+        avgOut = self._fc(self._avg_pool(x).view(b, c))
+        maxOut = self._fc(self._max_pool(x).view(b, c))
+        y = self._sigmoid(avgOut + maxOut).view(b, c, 1, 1, 1)
+        return x * y.expand_as(x)
+
+
+# 3D 空间注意力
+class SpatialAttention3D(nn.Module):
+    def __init__(self, kernel_size):
+        super(SpatialAttention3D, self).__init__()
+        self._conv = nn.Conv3d(in_channels=2,
+                               out_channels=1,
+                               kernel_size=kernel_size,
+                               stride=1,
+                               padding=(kernel_size - 1) // 2,
+                               bias=False)
+        self._sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        avgOut = torch.mean(x, dim=1, keepdim=True)
+        maxOut, _ = torch.max(x, dim=1, keepdim=True)
+        y = torch.cat([avgOut, maxOut], dim=1)
+        y = self._sigmoid(self._conv(y))
+        return x * y.expand_as(x)
+
+
+# 3D CBAM
+class CBAM3D(nn.Module):
+    def __init__(self, in_channels, reduction, kernel_size):
+        super(CBAM3D, self).__init__()
+        self.ChannelAtt = ChannelAttention3D(in_channels, reduction)
+        self.SpatialAtt = SpatialAttention3D(kernel_size)
+    
+    def forward(self, x):
+        x = self.ChannelAtt(x)
+        x = self.SpatialAtt(x)
+        return x
+
+
+# 3D 编码器
+class Encoder3D(nn.Module):
+    def __init__(self,
+                 in_channels,
+                 hid_channels_1,
+                 hid_channels_2,
+                 out_channels,
+                 down_samples,
+                 num_groups):
+        super(Encoder3D, self).__init__()
+
+        # [B, C, T, H, W] -> [B, C', T, H, W]
+        self._conv_1 = nn.Conv3d(in_channels=in_channels,
+                                 out_channels=hid_channels_1,
+                                 kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=(1, 1, 1))
+        
+        # [B, C', T, H, W] -> [B, C'', T, h, w]
+        self._down_samples = nn.ModuleList()
+        for i in range(down_samples):
+            cur_in_channels = hid_channels_1 if i == 0 else hid_channels_2
+            self._down_samples.append(
+                ResidualBlock3D(in_channels=cur_in_channels,
+                                hid_channels=cur_in_channels // 2)
+            )
+            self._down_samples.append(
+                DownSampleBlock3D(in_channels=cur_in_channels,
+                                  out_channels=hid_channels_2)
+            )
+
+        # [B, C'', T, h, w] -> [B, C'', T, h, w]
+        self._res_1 = ResidualBlock3D(in_channels=hid_channels_2,
+                                      hid_channels=hid_channels_2 // 2)
+        self._non_local = NonLocalBlock3D(in_channels=hid_channels_2,
+                                          hid_channels=hid_channels_2 // 2)
+        self._res_2 = ResidualBlock3D(in_channels=hid_channels_2,
+                                      hid_channels=hid_channels_2 // 2)
+        
+        self._group_norm = nn.GroupNorm(num_groups=num_groups,
+                                        num_channels=hid_channels_2)
+        self._swish = Swish()
+
+        # [B, C'', T, h, w] -> [B, D, T, h, w]
+        self._conv_2 = nn.Conv3d(in_channels=hid_channels_2,
+                                 out_channels=out_channels,
+                                 kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=(1, 1, 1))
+
+    def forward(self, x):  # [B, C, T, H, W]
+        x = self._conv_1(x)
+
+        for layer in self._down_samples:
+            x = layer(x)
+
+        x = self._res_1(x)
+        x = self._non_local(x)
+        x = self._res_2(x)
+
+        # GroupNorm 需要特殊处理：[B, C, T, H, W] -> [B, C, T*H, W]
+        b, c, t, h, w = x.size()
+        x = x.view(b, c, t*h, w)
+        x = self._group_norm(x)
+        x = x.view(b, c, t, h, w)
+        
+        x = self._swish(x)
+        x = self._conv_2(x)
+
+        return x  # [B, D, T, h, w]
+
+
+# 3D 解码器
+class Decoder3D(nn.Module):
+    def __init__(self,
+                 in_channels,
+                 hid_channels_1,
+                 hid_channels_2,
+                 out_channels,
+                 up_samples,
+                 num_groups):
+        super(Decoder3D, self).__init__()
+
+        # [B, D, T, h, w] -> [B, C'', T, h, w]
+        self._conv_1 = nn.Conv3d(in_channels=out_channels,
+                                 out_channels=hid_channels_2,
+                                 kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=(1, 1, 1))
+
+        # [B, C'', T, h, w] -> [B, C'', T, h, w]
+        self._res_1 = ResidualBlock3D(in_channels=hid_channels_2,
+                                      hid_channels=hid_channels_2 // 2)
+        self._non_local = NonLocalBlock3D(in_channels=hid_channels_2,
+                                          hid_channels=hid_channels_2 // 2)
+        self._res_2 = ResidualBlock3D(in_channels=hid_channels_2,
+                                      hid_channels=hid_channels_2 // 2)
+        
+        # [B, C'', T, h, w] -> [B, C', T, H, W]
+        self._up_samples = nn.ModuleList()
+        for i in range(up_samples):
+            cur_in_channels = hid_channels_2 if i == 0 else hid_channels_1
+            self._up_samples.append(
+                ResidualBlock3D(in_channels=cur_in_channels,
+                                hid_channels=cur_in_channels // 2)
+            )
+            self._up_samples.append(
+                UpSampleBlock3D(in_channels=cur_in_channels,
+                                out_channels=hid_channels_1)
+            )
+        
+        # [B, C', T, H, W] -> [B, C', T, H, W]
+        self._group_norm = nn.GroupNorm(num_groups=num_groups,
+                                        num_channels=hid_channels_1)
+        self._swish = Swish()
+
+        # [B, C', T, H, W] -> [B, C, T, H, W]
+        self._conv_2 = nn.Conv3d(in_channels=hid_channels_1,
+                                 out_channels=in_channels,
+                                 kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=(1, 1, 1))
+        
+    def forward(self, x):  # [B, D, T, h, w]
+        x = self._conv_1(x)
+        
+        x = self._res_1(x)
+        x = self._non_local(x)
+        x = self._res_2(x)
+
+        for layer in self._up_samples:
+            x = layer(x)
+
+        # GroupNorm 需要特殊处理
+        b, c, t, h, w = x.size()
+        x = x.view(b, c, t*h, w)
+        x = self._group_norm(x)
+        x = x.view(b, c, t, h, w)
+        
+        x = self._swish(x)
+        x = self._conv_2(x)
+
+        return x  # [B, C, T, H, W]
+
+
+# 3D AttentiveLISTA (保持时间维度的稀疏编码)
+class AttentiveLISTA3D(nn.Module):
+    def __init__(self,
+                 num_atoms,
+                 num_dims,
+                 num_iters,
+                 device):
+        super(AttentiveLISTA3D, self).__init__()
+
+        self._num_atoms = num_atoms
+        self._num_dims = num_dims
+        self._device = device
+
+        self._Dict = nn.Parameter(self.initialize_dct_weights())  # [D, K]
+        self._L = nn.Parameter((torch.norm(self._Dict, p=2)) ** 2)  # scalar
+        
+        # 3D 卷积处理时空特征
+        self._conv = nn.Conv3d(in_channels=num_dims,
+                               out_channels=num_atoms,
+                               kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=(1, 1, 1))
+        self._res1 = ResidualBlock3D(in_channels=num_atoms,
+                                     hid_channels=num_atoms//2)
+        self._res2 = ResidualBlock3D(in_channels=num_atoms,
+                                     hid_channels=num_atoms//2)
+        self._cbam = CBAM3D(in_channels=num_atoms,
+                            reduction=16,
+                            kernel_size=3)
+
+        self._Zero = torch.zeros(num_atoms).to(device)  # [K]
+        self._Identity = torch.eye(num_atoms).to(device)  # [K, K]
+
+        self._num_iters = num_iters
+    
+    def initialize_dct_weights(self):
+        n = math.ceil(math.sqrt(self._num_dims))
+        m = math.ceil(math.sqrt(self._num_atoms))
+        weights = init_dct(n, m)[:, :self._num_atoms]  # [D, K]
+        return weights
+    
+    def get_dict(self):
+        return self._Dict
+    
+    def set_dict(self, dictionary):
+        self._Dict = nn.Parameter(dictionary)
+        print("Dictionary initialized with pretrained values.")
+
+    def soft_thresh(self, x, theta):
+        return torch.sign(x) * torch.max(torch.abs(x) - theta, self._Zero)
+
+    def generation(self, input_z):  # [B, K, T, h, w]
+        # 转换维度用于矩阵乘法
+        b, k, t, h, w = input_z.size()
+        input_z = input_z.permute(0, 2, 3, 4, 1).contiguous()  # [B, T, h, w, K]
+        input_z = input_z.view(b * t * h * w, k)  # [B*T*h*w, K]
+        
+        x_recon = torch.matmul(input_z, self._Dict.t())  # [B*T*h*w, K] * [K, D] -> [B*T*h*w, D]
+        x_recon = x_recon.view(b, t, h, w, self._num_dims).permute(0, 4, 1, 2, 3).contiguous()  # [B, D, T, h, w]
+        return x_recon
+
+    def forward(self, x):  # [B, D, T, H, W]
+        B, D, T, H, W = x.size()
+        
+        # 3D 卷积提取时空特征
+        l = self._conv(x)  # [B, D, T, H, W] -> [B, K, T, H, W]
+        l = self._res1(l)
+        l = self._res2(l)
+        l = self._cbam(l) / self._L
+
+        # 稀疏编码（在每个时空点独立进行）
+        b, k, t, h, w = l.size()
+        l = l.permute(0, 2, 3, 4, 1).contiguous()  # [B, K, T, H, W] -> [B, T, H, W, K]
+        x = x.permute(0, 2, 3, 4, 1).contiguous()  # [B, D, T, H, W] -> [B, T, H, W, D]
+        
+        # 展平用于矩阵乘法
+        l = l.view(b * t * h * w, k)  # [B*T*H*W, K]
+        x = x.view(b * t * h * w, D)  # [B*T*H*W, D]
+        
+        S = self._Identity - (1 / self._L) * self._Dict.t().mm(self._Dict)  # [K, K]
+        S = S.t()  # [K, K]
+
+        y = torch.matmul(x, self._Dict)  # [B*T*H*W, D] * [D, K] -> [B*T*H*W, K]
+
+        z = self.soft_thresh(y, l)  # [B*T*H*W, K]
+        for iter_t in range(self._num_iters):
+            z = self.soft_thresh(torch.matmul(z, S) + (1 / self._L) * y, l)
+
+        x_recon = torch.matmul(z, self._Dict.t())  # [B*T*H*W, K] * [K, D] -> [B*T*H*W, D]
+
+        # 恢复维度
+        z = z.view(b, t, h, w, k).permute(0, 4, 1, 2, 3).contiguous()  # [B, K, T, h, w]
+        x_recon = x_recon.view(b, t, h, w, D).permute(0, 4, 1, 2, 3).contiguous()  # [B, D, T, h, w]
+
+        return z, x_recon, self._Dict
+
+
+# 3D Residual 块（用于 TranslatorWithResidual3D）
+class Residual3D(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, dropout_p=0.1):
+        super(Residual3D, self).__init__()
+        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size, stride, padding)
+        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size, stride, padding)
+        self.bn1 = nn.BatchNorm3d(out_channels)
+        self.bn2 = nn.BatchNorm3d(out_channels)
+        self.relu = nn.GELU()
+        self.dropout = nn.Dropout3d(dropout_p)
+        
+        # If input and output channels don't match, add a 1x1 convolution
+        self.match_channels = nn.Conv3d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else None
+
+    def forward(self, x):
+        residual = x
+
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+
+        x = self.conv2(x)
+        x = self.bn2(x)
+
+        if self.match_channels:
+            residual = self.match_channels(residual)
+
+        x += residual
+        x = self.relu(x)
+        return x
+
+
+# 3D TranslatorWithResidual
+class TranslatorWithResidual3D(nn.Module):
+    def __init__(self, C_in, C_hid, C_out, incep_ker=[3, 5, 7], dropout_p=0.1):
+        super(TranslatorWithResidual3D, self).__init__()
+
+        # Initial convolution block with residual
+        self.initial = Residual3D(C_in, C_hid, kernel_size=3, stride=1, padding=1, dropout_p=dropout_p)
+
+        # Branches for multi-scale features (inception-style)
+        self.branches = nn.ModuleList([
+            Residual3D(C_hid, C_out, kernel_size=k, stride=1, padding=k//2, dropout_p=dropout_p)
+            for k in incep_ker
+        ])
+
+        # Merge layers for final output
+        self.merge = nn.Sequential(
+            nn.Conv3d(len(incep_ker) * C_out, C_out, kernel_size=1),
+            nn.BatchNorm3d(C_out),
+            nn.Dropout3d(p=0.2)
+        )
+
+    def forward(self, x):  # [B, C_in, T, h, w]
+        residual = self.initial(x)  # [B, C_hid, T, h, w]
+        
+        branch_outputs = [branch(residual) for branch in self.branches]
+        x = torch.cat(branch_outputs, dim=1)  # [B, len(incep_ker)*C_out, T, h, w]
+        x = self.merge(x)  # [B, C_out, T, h, w]
+
+        return x
+
+
+# ============================================================================
+# 🎬 3D SSCVAE (真正的多帧时序模型)
+# ============================================================================
+
+class SSCVAE3D(nn.Module):
+    def __init__(self,
+                 in_channels_sate,  # 卫星图像通道数 (3)
+                 in_channels_radar,  # 雷达图像通道数 (1)
+                 hid_channels_1,
+                 hid_channels_2,
+                 out_channels,
+                 down_samples,
+                 num_groups,
+                 num_atoms,
+                 num_dims,
+                 num_iters,
+                 device):
+        super(SSCVAE3D, self).__init__()
+
+        self._encoder_sate = Encoder3D(in_channels=in_channels_sate,
+                                       hid_channels_1=hid_channels_1,
+                                       hid_channels_2=hid_channels_2,
+                                       out_channels=out_channels,
+                                       down_samples=down_samples,
+                                       num_groups=num_groups)
+
+        self._decoder_sate = Decoder3D(in_channels=in_channels_sate,
+                                       hid_channels_1=hid_channels_1,
+                                       hid_channels_2=hid_channels_2,
+                                       out_channels=out_channels,
+                                       up_samples=down_samples,
+                                       num_groups=num_groups)
+
+        self._encoder_radar = Encoder3D(in_channels=in_channels_radar,
+                                        hid_channels_1=hid_channels_1,
+                                        hid_channels_2=hid_channels_2,
+                                        out_channels=out_channels,
+                                        down_samples=down_samples,
+                                        num_groups=num_groups)
+
+        self._decoder_radar = Decoder3D(in_channels=in_channels_radar,
+                                        hid_channels_1=hid_channels_1,
+                                        hid_channels_2=hid_channels_2,
+                                        out_channels=out_channels,
+                                        up_samples=down_samples,
+                                        num_groups=num_groups)
+
+        self._LISTA = AttentiveLISTA3D(num_atoms=num_atoms,
+                                       num_dims=num_dims,
+                                       num_iters=num_iters,
+                                       device=device)
+
+        self._mlp = TranslatorWithResidual3D(C_in=128, C_hid=196, C_out=128, incep_ker=[1, 3, 5])
+
+    def generation(self, input_z):
+        ex = self._LISTA.generation(input_z)  # [B, K, T, h, w] -> [B, D, T, h, w]
+        x_generation = self._decoder_radar(ex)  # [B, D, T, h, w] -> [B, C, T, H, W]
+        x_generation = torch.sigmoid(x_generation)
+        return ex, x_generation
+    
+    def get_dict(self):
+        return self._LISTA.get_dict()
+
+    def forward(self, satellite, vil):
+        """
+        Args:
+            satellite: [B, C, H, W, T] 或 [B, C, T, H, W]
+            vil: [B, C, H, W, T] 或 [B, C, T, H, W]
+        Returns:
+            x_recon_trans: [B, C, T, H, W]
+            z: [B, K, T, h, w]
+            ...
+        """
+        # 统一输入格式为 [B, C, T, H, W]
+        if satellite.dim() == 5:
+            # 判断是 [B, C, H, W, T] 还是 [B, C, T, H, W]
+            if satellite.size(2) < satellite.size(4):  # H < T，说明是 [B, C, H, W, T]
+                satellite = satellite.permute(0, 1, 4, 2, 3).contiguous()  # -> [B, C, T, H, W]
+                vil = vil.permute(0, 1, 4, 2, 3).contiguous()
+        
+        # 3D 编码（时空联合）
+        ex = self._encoder_sate(satellite)  # [B, C, T, H, W] -> [B, D, T, h, w]
+        ex_radar = self._encoder_radar(vil)  # [B, C, T, H, W] -> [B, D, T, h, w]
+
+        # 3D 稀疏编码
+        z, ex_recon, dictionary = self._LISTA(ex)  # [B, D, T, h, w] -> [B, K, T, h, w]
+        z_radar, ex_recon_radar, dictionary_radar = self._LISTA(ex_radar)
+
+        # 3D 转换
+        z_trans = self._mlp(z)  # [B, K, T, h, w] -> [B, K, T, h, w]
+
+        # 3D 解码
+        ex_trans, x_recon_trans = self.generation(z_trans)  # [B, K, T, h, w] -> [B, C, T, H, W]
+
+        # 计算损失
+        reconstruction_loss = segmented_weighted_loss(x_recon_trans, vil)
+        z_diff_loss = F.mse_loss(z_trans, z_radar)
+        latent_dist_loss = z_diff_loss
+        latent_trans_loss = torch.sum((ex_trans - ex_radar).pow(2), dim=1).mean()
+
+        return x_recon_trans, z, latent_dist_loss, latent_trans_loss, reconstruction_loss, dictionary
+
+
+# 3D SSCVAEDouble (双解码器版本)
+class SSCVAEDouble3D(nn.Module):
+    def __init__(self,
+                 in_channels_sate,
+                 in_channels_radar,
+                 hid_channels_1,
+                 hid_channels_2,
+                 out_channels,
+                 down_samples,
+                 num_groups,
+                 num_atoms,
+                 num_dims,
+                 num_iters,
+                 device):
+        super(SSCVAEDouble3D, self).__init__()
+
+        self._encoder_sate = Encoder3D(in_channels=in_channels_sate,
+                                       hid_channels_1=hid_channels_1,
+                                       hid_channels_2=hid_channels_2,
+                                       out_channels=out_channels,
+                                       down_samples=down_samples,
+                                       num_groups=num_groups)
+
+        self._decoder_sate = Decoder3D(in_channels=in_channels_sate,
+                                       hid_channels_1=hid_channels_1,
+                                       hid_channels_2=hid_channels_2,
+                                       out_channels=out_channels,
+                                       up_samples=down_samples,
+                                       num_groups=num_groups)
+
+        self._encoder_radar = Encoder3D(in_channels=in_channels_radar,
+                                        hid_channels_1=hid_channels_1,
+                                        hid_channels_2=hid_channels_2,
+                                        out_channels=out_channels,
+                                        down_samples=down_samples,
+                                        num_groups=num_groups)
+
+        self._decoder_radar = Decoder3D(in_channels=in_channels_radar,
+                                        hid_channels_1=hid_channels_1,
+                                        hid_channels_2=hid_channels_2,
+                                        out_channels=out_channels,
+                                        up_samples=down_samples,
+                                        num_groups=num_groups)
+
+        self._LISTA = AttentiveLISTA3D(num_atoms=num_atoms,
+                                       num_dims=num_dims,
+                                       num_iters=num_iters,
+                                       device=device)
+
+    def generation(self, input_z, is_sate=True):
+        if is_sate:
+            ex = self._LISTA.generation(input_z)
+            x_generation = self._decoder_sate(ex)
+        else:
+            ex = self._LISTA.generation(input_z)
+            x_generation = self._decoder_radar(ex)
+        
+        x_generation = torch.sigmoid(x_generation)
+        return x_generation
+    
+    def get_dict(self):
+        return self._LISTA.get_dict()
+
+    def forward(self, satellite, vil):
+        """
+        Args:
+            satellite: [B, C, H, W, T] 或 [B, C, T, H, W]
+            vil: [B, C, H, W, T] 或 [B, C, T, H, W]
+        Returns:
+            x_recon_sate: [B, C, T, H, W]
+            x_recon_radar: [B, C, T, H, W]
+            z_sate: [B, K, T, h, w]
+            z_radar: [B, K, T, h, w]
+            total_latent_loss: scalar
+            dictionary: [D, K]
+        """
+        # 统一输入格式为 [B, C, T, H, W]
+        if satellite.dim() == 5:
+            if satellite.size(2) < satellite.size(4):  # H < T，说明是 [B, C, H, W, T]
+                satellite = satellite.permute(0, 1, 4, 2, 3).contiguous()
+                vil = vil.permute(0, 1, 4, 2, 3).contiguous()
+        
+        # 3D 编码
+        ex_sate = self._encoder_sate(satellite)  # [B, C, T, H, W] -> [B, D, T, h, w]
+        ex_radar = self._encoder_radar(vil)
+
+        # 3D 稀疏编码
+        z_sate, ex_recon_sate, dictionary = self._LISTA(ex_sate)  # [B, D, T, h, w] -> [B, K, T, h, w]
+        z_radar, ex_recon_radar, _ = self._LISTA(ex_radar)
+        
+        # 3D 解码
+        x_recon_sate = torch.sigmoid(self._decoder_sate(ex_recon_sate))  # [B, K, T, h, w] -> [B, C, T, H, W]
+        x_recon_radar = torch.sigmoid(self._decoder_radar(ex_recon_radar))
 
         # 计算损失
         latent_loss_sate = torch.sum((ex_recon_sate - ex_sate).pow(2), dim=1).mean()

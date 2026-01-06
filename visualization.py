@@ -51,8 +51,8 @@ def plot_image_three_channel(image, image_fold_path, image_name, channels):
     axs[1].set_title('IR 10.7')
     axs[1].axis('off')
 
-    axs[2].imshow(image[:, :, 2],cmap=lght_cmap,norm=lght_norm,vmin=lght_vmin,vmax=lght_vmax)  # 使用 cividis 色图
-    axs[2].set_title('VIL')
+    axs[2].imshow(image[:, :, 2],cmap=lght_cmap,norm=lght_norm,vmin=lght_vmin,vmax=lght_vmax)  # 使用闪电色图
+    axs[2].set_title('Lightning')  # ✅ 修正标题：这是闪电数据
     axs[2].axis('off')
 
     # 保存图像

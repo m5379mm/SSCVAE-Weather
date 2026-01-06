@@ -1,4 +1,4 @@
-
+from enhanced_losses import EnhancedReconstructionLoss
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -116,7 +116,7 @@ def train(data_args, model_args, train_args, test_args):
     model = SSCVAE(**vars(model_args), device=device).to(device)
 
     # load_path = os.path.join(train_args.origin_path, 'models', 'best_model.pt')
-    load_path = "/root/autodl-tmp/results/sscvae_recon_sevir_trans_single/models/best_modellastbest.pth"
+    load_path = "/root/autodl-tmp/results/sscvae_recon_sevir_trans/models/best_model.pt"
     print(f"📂 加载预训练模型: {load_path}")
     # input()
     
@@ -126,6 +126,31 @@ def train(data_args, model_args, train_args, test_args):
         print("✅ 成功加载预训练权重")
     else:
         print("⚠️  未找到预训练模型，从头开始训练")
+
+    # ==================== Initialize Enhanced Loss ====================
+    criterion = EnhancedReconstructionLoss(
+        use_perceptual=True,
+        use_edge=True,
+        use_ssim=True,
+        use_focal=False,
+        perceptual_weight=0.1,    # 推荐：0.05-0.2
+        edge_weight=0.5,          # 推荐：0.3-1.0
+        ssim_weight=0.5,          # 推荐：0.3-0.8
+        segmented_weight=1.0
+    ).to(device)
+
+    print("\n" + "="*60)
+    print("🎨 Using Enhanced Reconstruction Loss")
+    print("="*60)
+    print(f"  Segmented Weight:  {criterion.segmented_weight:.3f}")
+    if criterion.use_perceptual:
+        print(f"  Perceptual Weight: {criterion.perceptual_weight:.3f} ✓")
+    if criterion.use_edge:
+        print(f"  Edge Weight:       {criterion.edge_weight:.3f} ✓")
+    if criterion.use_ssim:
+        print(f"  SSIM Weight:       {criterion.ssim_weight:.3f} ✓")
+    print("="*60 + "\n")
+    # =================================================================
 
     # ============ 训练策略选择 ============
     # 策略1: 只训练MLP (快速，但效果受限于单帧预训练特征)
@@ -202,8 +227,8 @@ def train(data_args, model_args, train_args, test_args):
             optimizer.zero_grad()
             # SSCVAE 返回 6 个值
             x_recon_trans, z, latent_dist_loss, latent_trans_loss, recon_loss, dictionary = model(satellite, vil)
-
-            loss = (w["recon"]  * recon_loss +
+            reconstruction_loss, loss_dict = criterion(x_recon_trans, vil)
+            loss = (w["recon"]  * reconstruction_loss +
                     0.3*latent_dist_loss+
                     w["trans"]  * latent_trans_loss)
 
@@ -214,7 +239,7 @@ def train(data_args, model_args, train_args, test_args):
             bs = satellite.size(0)
             train_losses["latent_dist"] += latent_dist_loss.item() * bs
             train_losses["latent_trans"] += latent_trans_loss.item() * bs
-            train_losses["recon"] += recon_loss.item() * bs
+            train_losses["recon"] += reconstruction_loss.item() * bs
             train_losses["total"] += loss.item() * bs
             train_losses["sparsity"] += sparsity_loss.item() * bs
 
@@ -228,8 +253,11 @@ def train(data_args, model_args, train_args, test_args):
             for satellite, vil in val_loader:
                 satellite, vil = satellite.to(device), vil.to(device)
                 # SSCVAE 返回 6 个值
-                x_recon_trans, z, latent_dist_loss, latent_trans_loss, recon_loss, dictionary = model(satellite, vil)
-                # print(latent_dist_loss)
+                x_recon_trans, z, latent_dist_loss, latent_trans_loss, _, dictionary = model(satellite, vil)
+                
+                # 使用增强损失
+                recon_loss, loss_dict = criterion(x_recon_trans, vil)
+                
                 loss = (w["recon"]  * recon_loss +
                        0.3*latent_dist_loss+
                         w["trans"]  * latent_trans_loss)
